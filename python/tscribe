@@ -1,66 +1,114 @@
 #!/usr/bin/env python
-import os
-import re
-import sys
+import argparse
 import boto3
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError
+import os
+import re
 import subprocess
+import sys
 import time
 
-# Take an audio file as an argument from the command line
-if len(sys.argv) < 2:
-    print("Please provide the audio file path as an argument.")
-    sys.exit(1)
+def parse_arguments():
+    """
+    Parse command-line arguments.
 
-audio_file_path = sys.argv[1]
-print(f"Audio file path: {audio_file_path}")
-source_dir = os.path.dirname(os.path.abspath(audio_file_path))
+    Returns:
+        argparse.Namespace: An object containing the parsed arguments.
+    """
+    description = """
+    This script automates the process of transcribing audio files using Amazon Transcribe
+    and converting the transcription to a Word document. It performs the following steps:
 
-# Set the basename of the audio file path to audio_file_name and media_format to audio_file_name extension
-audio_file_name, ext = os.path.splitext(os.path.basename(audio_file_path))
+    1. Uploads the specified audio file to an S3 bucket.
+    2. Initiates a transcription job using Amazon Transcribe.
+    3. Waits for the transcription job to complete.
+    4. Processes the completed transcription, generating a Word document.
 
-media_format = ext.lstrip(".")
+    The script uses AWS services and requires proper AWS credentials to be configured.
+    It supports various audio formats and allows customization of the transcription process.
+    """
 
-# Get username
-if os.name == "nt":  # Windows
-    username = os.getenv("USERNAME")
-else:  # Unix-based systems
-    import getpass
-    username = getpass.getuser()
+    epilog = "Example: %(prog)s path/to/audio.mp3 --region us-west-2 --vocabulary my-custom-vocab --max-speakers 4"
 
-# Set the region
-region_name = "us-west-2"
+    parser = argparse.ArgumentParser(
+        description=description,
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("audio_file", help="Path to the audio file to transcribe")
+    parser.add_argument("--region", default="us-west-2", help="AWS region for S3 and Transcribe services (default: us-west-2)")
+    parser.add_argument("--vocabulary", default=None, help="Name of the custom vocabulary to use in Amazon Transcribe (default: None)")
+    parser.add_argument("--max-speakers", type=int, default=8, help="Maximum number of speakers to identify in the audio (default: 8)")
+    
+    return parser.parse_args()
 
-# Create an S3 client
-s3 = boto3.client("s3", region_name=region_name)
-
-# Set the bucket names
-input_bucket_name = username + "-audio-files"
-output_bucket_name = username + "-audio-files-transcribed"
+def is_macos():
+    return sys.platform == "darwin" or platform.system() == "Darwin"
 
 def sanitize_s3_key(name):
-    # Replace spaces with underscores
+    """
+    Sanitize a string to be used as an S3 object key.
+
+    This function performs the following operations:
+    1. Replaces spaces with underscores.
+    2. Removes all characters that are not alphanumeric, underscore, period, or hyphen.
+    3. Removes leading periods and hyphens.
+
+    Args:
+        name (str): The original string to be sanitized.
+
+    Returns:
+        str: The sanitized string, safe to use as an S3 object key.
+
+    Example:
+        >>> sanitize_s3_key("My File Name! (v1.2)")
+        'My_File_Name_v1.2'
+    """
     name = name.replace(' ', '_')
-    
-    # Remove or replace special characters
     name = re.sub(r'[^a-zA-Z0-9-_.]', '', name)
-    
-    # Ensure the name doesn't start with a period or dash
     name = name.lstrip('.-')
-    
     return name
 
-def create_bucket_if_not_exists(bucket_name):
+def create_bucket_if_not_exists(s3, bucket_name, region_name):
+    """
+    Check if an S3 bucket exists, and create it if it doesn't.
+
+    This function attempts to check the existence of a specified S3 bucket.
+    If the bucket doesn't exist, it tries to create it in the specified region.
+    The function handles various scenarios and exceptions that may occur during
+    this process.
+
+    Args:
+        s3 (boto3.client or boto3.resource): The boto3 S3 client or resource object.
+        bucket_name (str): The name of the S3 bucket to check/create.
+        region_name (str): The AWS region where the bucket should be created.
+
+    Returns:
+        None
+
+    Raises:
+        No exceptions are raised; all exceptions are caught and handled internally.
+
+    Side Effects:
+        - Prints status messages to stdout.
+        - May create an S3 bucket if it doesn't exist.
+
+    Note:
+        This function works with both boto3 client and resource objects.
+        It uses different methods to check bucket existence based on the type of 's3' parameter.
+
+    Example:
+        s3_client = boto3.client('s3')
+        create_bucket_if_not_exists(s3_client, 'my-bucket', 'XXXwest-2')
+    """
     try:
-        # Check if the bucket exists
         if isinstance(s3, BaseClient):
             s3.head_bucket(Bucket=bucket_name)
         else:
             s3.Bucket(bucket_name).creation_date
         print(f"Bucket '{bucket_name}' already exists.")
     except ClientError as e:
-        # If the bucket doesn't exist, create it
         if e.response['Error']['Code'] == '404':
             try:
                 s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={
@@ -77,75 +125,214 @@ def create_bucket_if_not_exists(bucket_name):
     except Exception as e:
         print(f"Error checking bucket '{bucket_name}': {e}")
 
-# Create the input bucket if it doesn't exist
-create_bucket_if_not_exists(input_bucket_name)
+def setup_s3_buckets(s3, username, region_name):
+    """
+    Set up audio file input S3 bucket for the transcription process.
 
-# Create the output bucket if it doesn't exist
-create_bucket_if_not_exists(output_bucket_name)
+    Args:
+        s3 (boto3.client): The boto3 S3 client object.
+        username (str): The username to be used in bucket names.
+        region_name (str): The AWS region where the buckets should be created.
 
-# Upload the audio file from audio_file_path to the s3://ericn-meeting-notes bucket
-s3_object_name = sanitize_s3_key(audio_file_name)
-try:
-    s3.upload_file(audio_file_path, input_bucket_name, s3_object_name)
-    print(f"Successfully uploaded {s3_object_name} to s3://{input_bucket_name}")
-except Exception as e:
-    print(f"Error uploading file: {e}")
+    Returns:
+        tuple: A tuple containing the name of the input bucket.
+    """
+    input_bucket_name = username + "-audio-files"
+    create_bucket_if_not_exists(s3, input_bucket_name, region_name)
+    return input_bucket_name
 
-# Transcribe the audio file using the Amazon Transcribe service
-transcribe = boto3.client("transcribe")
-job_name = s3_object_name
-job_uri = f"s3://{input_bucket_name}/{s3_object_name}"
-vocabulary_name = "ASBX-vocabulary"
-# Check if a transcription job with the same name already exists
-try:
-    job = transcribe.get_transcription_job(TranscriptionJobName=job_name)
-    job_status = job["TranscriptionJob"]["TranscriptionJobStatus"]
-    if job_status in ["QUEUED", "IN_PROGRESS", "COMPLETED"]:
-        print(f"A transcription job with the name {job_name} already exists and is in {job_status} state.")
-        print("Deleting the existing job...")
-        transcribe.delete_transcription_job(TranscriptionJobName=job_name)
-    else:
-        print(f"A transcription job with the name {job_name} already exists and is in {job_status} state.")
-        print("You may want to choose a different job name or handle this case accordingly.")
-except transcribe.exceptions.BadRequestException:
-    # If the job doesn't exist, this exception will be raised, and we can proceed with starting a new job
-    pass
+def upload_file_to_s3(s3, file_path, bucket_name):
+    """
+    Upload a file to an S3 bucket.
 
-# Start a new transcription job
-transcribe.start_transcription_job(
-    TranscriptionJobName=job_name,
-    LanguageCode="en-US",
-    Media={"MediaFileUri": job_uri},
-    MediaFormat=media_format,
-    Settings={"VocabularyName": vocabulary_name, "ShowSpeakerLabels": True, "MaxSpeakerLabels": 8}
-)
-print(f"Transcription job {job_name} started.")
+    Args:
+        s3 (boto3.client): The boto3 S3 client object.
+        file_path (str): The local path of the file to upload.
+        bucket_name (str): The name of the S3 bucket to upload to.
 
-# Wait for the transcription job to complete
-while True:
-    job = transcribe.get_transcription_job(TranscriptionJobName=job_name)
-    status = job["TranscriptionJob"]["TranscriptionJobStatus"]
-    if status in ["COMPLETED", "FAILED"]:
-        break
-    print(f"Waiting for transcription job {job_name}. Current status: {status}.")
-    time.sleep(10)  # Wait for 10 seconds before checking again
+    Returns:
+        str: The S3 object name (key) of the uploaded file.
+    """
+    s3_object_name = sanitize_s3_key(os.path.basename(file_path))
+    try:
+        s3.upload_file(file_path, bucket_name, s3_object_name)
+        print(f"Successfully uploaded {s3_object_name} to s3://{bucket_name}")
+    except Exception as e:
+        print(f"Error uploading file: {e}")
+    return s3_object_name
 
-# Check if the job was successful, then convert the transcript to a Word doc.
-if status == "COMPLETED":
-    print(f"Transcription job {job_name} completed successfully.")
+def check_vocabulary_exists(transcribe, vocabulary_name):
+    """
+    Check if a vocabulary exists in the specified Transcribe account.
 
-    # Get the directory of the current script
-    current_dir = os.path.dirname(os.path.abspath(__file__))
+    Args:
+        transcribe (boto3.client): The boto3 Transcribe client object.
+        vocabulary_name (str): The name of the vocabulary to check.
 
-    # Run the ts-to-word.py script with the job_name as an argument
+    Returns:
+        bool: True if the vocabulary exists, False otherwise.
+    """
+    try:
+        transcribe.get_vocabulary(VocabularyName=vocabulary_name)
+        return True
+    except transcribe.exceptions.NotFoundException:
+        return False
+    except Exception as e:
+        print(f"Error checking vocabulary: {e}")
+        return False
+
+
+def manage_transcription_job(transcribe, job_name, job_uri, media_format, vocabulary_name, max_speakers):
+    """
+    Manage the creation and start of a transcription job.
+
+    This function checks for existing jobs with the same name, deletes them if necessary,
+    and starts a new transcription job.
+
+    Args:
+        transcribe (boto3.client): The boto3 Transcribe client object.
+        job_name (str): The name of the transcription job.
+        job_uri (str): The S3 URI of the audio file to transcribe.
+        media_format (str): The format of the audio file.
+        vocabulary_name (str): The name of the custom vocabulary to use, or None.
+        max_speakers (int): The maximum number of speakers to identify.
+    """
+    try:
+        job = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+        job_status = job["TranscriptionJob"]["TranscriptionJobStatus"]
+        if job_status in ["QUEUED", "IN_PROGRESS", "COMPLETED"]:
+            print(f"A transcription job with the name {job_name} already exists and is in {job_status} state.")
+            print("Deleting the existing job...")
+            transcribe.delete_transcription_job(TranscriptionJobName=job_name)
+    except transcribe.exceptions.BadRequestException:
+        pass
+
+    job_settings = {
+        "ShowSpeakerLabels": True,
+        "MaxSpeakerLabels": max_speakers
+    }
+
+    if vocabulary_name:
+        if check_vocabulary_exists(transcribe, vocabulary_name):
+            job_settings["VocabularyName"] = vocabulary_name
+        else:
+            print(f"Warning: Vocabulary '{vocabulary_name}' not found. Proceeding without custom vocabulary.")
+
+    transcribe.start_transcription_job(
+        TranscriptionJobName=job_name,
+        LanguageCode="en-US",
+        Media={"MediaFileUri": job_uri},
+        MediaFormat=media_format,
+        Settings=job_settings
+    )
+    print(f"Transcription job {job_name} started.")
+
+
+def wait_for_transcription_job(transcribe, job_name):
+    """
+    Wait for a transcription job to complete.
+
+    Args:
+        transcribe (boto3.client): The boto3 Transcribe client object.
+        job_name (str): The name of the transcription job to wait for.
+
+    Returns:
+        str: The final status of the transcription job.
+    """
+    while True:
+        job = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+        status = job["TranscriptionJob"]["TranscriptionJobStatus"]
+        if status in ["COMPLETED", "FAILED"]:
+            break
+        print(f"Waiting for transcription job {job_name}. Current status: {status}.")
+        time.sleep(10)
+    return status
+
+def process_completed_job(job_name, source_dir, current_dir):
+    """
+    Process a completed transcription job by generating a Word document.
+
+    Args:
+        job_name (str): The name of the completed transcription job.
+        source_dir (str): The directory where the output file should be saved.
+        current_dir (str): The directory containing the ts-to-word.py script.
+    """
     output_file = job_name + ".docx"
     output_path = os.path.join(source_dir, output_file)
     try:
         subprocess.run(["python", "ts-to-word.py", "--inputJob", job_name, "--outputFile", output_path], cwd=current_dir)
     except subprocess.CalledProcessError as e:
         print(f"Error running ts-to-word.py: {e}")
-else:
-    print(f"Transcription job {job_name} failed with status: {status}.")
-    if "FailureReason" in job["TranscriptionJob"]:
-        print(f"Failure reason: {job['TranscriptionJob']['FailureReason']}")
 
+def get_username():
+    """
+    Get the current user's username.
+
+    Returns:
+        str: The username of the current user.
+    """
+    if os.name == "nt":  # Windows
+        return os.getenv("USERNAME")
+    else:  # Unix-based systems
+        import getpass
+        return getpass.getuser()
+
+def handle_job_completion(transcribe, job_name, status, audio_file_path):
+    """
+    Handle the completion of a transcription job, whether successful or failed.
+
+    Args:
+        transcribe (boto3.client): The boto3 Transcribe client object.
+        job_name (str): The name of the transcription job.
+        status (str): The final status of the transcription job.
+        audio_file_path (str): The path to the original audio file.
+
+    Returns:
+        None
+    """
+    if status == "COMPLETED":
+        print(f"Transcription job {job_name} completed successfully.")
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        source_dir = os.path.dirname(os.path.abspath(audio_file_path))
+        process_completed_job(job_name, source_dir, current_dir)
+    else:
+        print(f"Transcription job {job_name} failed with status: {status}.")
+        job = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+        if "FailureReason" in job["TranscriptionJob"]:
+            print(f"Failure reason: {job['TranscriptionJob']['FailureReason']}")
+
+
+def main():
+    args = parse_arguments()
+    
+    s3 = boto3.client("s3", region_name=args.region)
+    transcribe = boto3.client("transcribe", region_name=args.region)
+    
+    username = get_username()
+    input_bucket, output_bucket = setup_s3_buckets(s3, username, args.region)
+    
+    s3_object_name = upload_file_to_s3(s3, args.audio_file, input_bucket)
+    
+    job_uri = f"s3://{input_bucket}/{s3_object_name}"
+    media_format = os.path.splitext(args.audio_file)[1].lstrip(".")
+    
+    vocabulary_name = args.vocabulary
+    if vocabulary_name is None:
+        default_vocabulary = "ASBX-vocabulary"
+        if check_vocabulary_exists(transcribe, default_vocabulary):
+            vocabulary_name = default_vocabulary
+        else:
+            print(f"Default vocabulary '{default_vocabulary}' not found. Proceeding without custom vocabulary.")
+    
+    manage_transcription_job(transcribe, s3_object_name, job_uri, media_format, vocabulary_name, args.max_speakers)
+    
+    status = wait_for_transcription_job(transcribe, s3_object_name)
+    
+    handle_job_completion(transcribe, s3_object_name, status, args.audio_file)
+
+    # If on macOS, open the Word document
+    if is_macos():
+        subprocess.run(["open", f"{s3_object_name}.docx"])
+
+if __name__ == "__main__":
+    main()
