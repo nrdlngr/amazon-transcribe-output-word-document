@@ -1,13 +1,31 @@
 #!/usr/bin/env python
+"""
+Amazon Transcribe Audio Processing Script
+
+This script automates the process of transcribing audio files using Amazon Transcribe
+and converting the transcription to a Word document. It handles S3 bucket setup,
+transcription job management, and Word document creation.
+
+The script requires proper AWS credentials to be configured.
+
+Usage:
+    python script_name.py <audio_file> [options]
+
+For detailed usage instructions, run:
+    python script_name.py --help
+"""
+# Standard library imports
 import argparse
-import boto3
-from botocore.client import BaseClient
-from botocore.exceptions import ClientError
 import os
 import re
 import subprocess
 import sys
 import time
+
+# Third-party imports
+import boto3
+from botocore.client import BaseClient
+from botocore.exceptions import ClientError
 
 def parse_arguments():
     description = """
@@ -38,6 +56,16 @@ def parse_arguments():
     return parser.parse_args()
 
 def is_macos():
+    """
+    Check if the current operating system is macOS.
+
+    This function uses both sys.platform and platform.system() to determine
+    if the current operating system is macOS. It checks for both "darwin" 
+    (lowercase) and "Darwin" (capitalized) to cover different possible return values.
+
+    Returns:
+        bool: True if the current OS is macOS, False otherwise.
+    """
     return sys.platform == "darwin" or platform.system() == "Darwin"
 
 def sanitize_s3_key(name):
@@ -129,7 +157,7 @@ def setup_s3_buckets(s3, username, region_name):
         region_name (str): The AWS region where the buckets should be created.
 
     Returns:
-        tuple: A tuple containing the name of the input bucket.
+        str: The name of the input bucket.
     """
     input_bucket_name = username + "-audio-files"
     create_bucket_if_not_exists(s3, input_bucket_name, region_name)
