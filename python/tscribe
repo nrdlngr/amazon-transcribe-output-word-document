@@ -194,10 +194,16 @@ def manage_transcription_job(transcribe, job_name, job_uri, media_format, vocabu
     try:
         job = transcribe.get_transcription_job(TranscriptionJobName=job_name)
         job_status = job["TranscriptionJob"]["TranscriptionJobStatus"]
-        if job_status in ["QUEUED", "IN_PROGRESS", "COMPLETED"]:
+        if job_status in ["QUEUED", "COMPLETED"]:
             print(f"A transcription job with the name {job_name} already exists and is in {job_status} state.")
             print("Deleting the existing job...")
             transcribe.delete_transcription_job(TranscriptionJobName=job_name)
+        elif job_status in ["IN_PROGRESS"]:
+            print(f"A transcription job with the name {job_name} already exists and is in {job_status} state.")
+            wait_for_transcription_job(transcribe, job_name)
+            print("Deleting the existing job...")
+            transcribe.delete_transcription_job(TranscriptionJobName=job_name)
+
     except transcribe.exceptions.BadRequestException:
         pass
 
@@ -238,7 +244,7 @@ def wait_for_transcription_job(transcribe, job_name):
         status = job["TranscriptionJob"]["TranscriptionJobStatus"]
         if status in ["COMPLETED", "FAILED"]:
             break
-        print(f"Waiting for transcription job {job_name}. Current status: {status}.")
+        print(f"Waiting for transcription job to complete... Current status: {status}.")
         time.sleep(10)
     return status
 
