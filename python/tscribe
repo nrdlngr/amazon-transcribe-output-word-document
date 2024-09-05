@@ -10,12 +10,6 @@ import sys
 import time
 
 def parse_arguments():
-    """
-    Parse command-line arguments.
-
-    Returns:
-        argparse.Namespace: An object containing the parsed arguments.
-    """
     description = """
     This script automates the process of transcribing audio files using Amazon Transcribe
     and converting the transcription to a Word document. It performs the following steps:
