@@ -1,0 +1,151 @@
+#!/usr/bin/env python
+import os
+import re
+import sys
+import boto3
+from botocore.client import BaseClient
+from botocore.exceptions import ClientError
+import subprocess
+import time
+
+# Take an audio file as an argument from the command line
+if len(sys.argv) < 2:
+    print("Please provide the audio file path as an argument.")
+    sys.exit(1)
+
+audio_file_path = sys.argv[1]
+print(f"Audio file path: {audio_file_path}")
+source_dir = os.path.dirname(os.path.abspath(audio_file_path))
+
+# Set the basename of the audio file path to audio_file_name and media_format to audio_file_name extension
+audio_file_name, ext = os.path.splitext(os.path.basename(audio_file_path))
+
+media_format = ext.lstrip(".")
+
+# Get username
+if os.name == "nt":  # Windows
+    username = os.getenv("USERNAME")
+else:  # Unix-based systems
+    import getpass
+    username = getpass.getuser()
+
+# Set the region
+region_name = "us-west-2"
+
+# Create an S3 client
+s3 = boto3.client("s3", region_name=region_name)
+
+# Set the bucket names
+input_bucket_name = username + "-audio-files"
+output_bucket_name = username + "-audio-files-transcribed"
+
+def sanitize_s3_key(name):
+    # Replace spaces with underscores
+    name = name.replace(' ', '_')
+    
+    # Remove or replace special characters
+    name = re.sub(r'[^a-zA-Z0-9-_.]', '', name)
+    
+    # Ensure the name doesn't start with a period or dash
+    name = name.lstrip('.-')
+    
+    return name
+
+def create_bucket_if_not_exists(bucket_name):
+    try:
+        # Check if the bucket exists
+        if isinstance(s3, BaseClient):
+            s3.head_bucket(Bucket=bucket_name)
+        else:
+            s3.Bucket(bucket_name).creation_date
+        print(f"Bucket '{bucket_name}' already exists.")
+    except ClientError as e:
+        # If the bucket doesn't exist, create it
+        if e.response['Error']['Code'] == '404':
+            try:
+                s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={
+                    'LocationConstraint': region_name
+                })
+                print(f"Bucket '{bucket_name}' created successfully.")
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'BucketAlreadyOwnedByYou':
+                    print(f"Bucket '{bucket_name}' already exists and is owned by you.")
+                else:
+                    print(f"Error creating bucket '{bucket_name}': {e}")
+        else:
+            print(f"Error checking bucket '{bucket_name}': {e}")
+    except Exception as e:
+        print(f"Error checking bucket '{bucket_name}': {e}")
+
+# Create the input bucket if it doesn't exist
+create_bucket_if_not_exists(input_bucket_name)
+
+# Create the output bucket if it doesn't exist
+create_bucket_if_not_exists(output_bucket_name)
+
+# Upload the audio file from audio_file_path to the s3://ericn-meeting-notes bucket
+s3_object_name = sanitize_s3_key(audio_file_name)
+try:
+    s3.upload_file(audio_file_path, input_bucket_name, s3_object_name)
+    print(f"Successfully uploaded {s3_object_name} to s3://{input_bucket_name}")
+except Exception as e:
+    print(f"Error uploading file: {e}")
+
+# Transcribe the audio file using the Amazon Transcribe service
+transcribe = boto3.client("transcribe")
+job_name = s3_object_name
+job_uri = f"s3://{input_bucket_name}/{s3_object_name}"
+vocabulary_name = "ASBX-vocabulary"
+# Check if a transcription job with the same name already exists
+try:
+    job = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+    job_status = job["TranscriptionJob"]["TranscriptionJobStatus"]
+    if job_status in ["QUEUED", "IN_PROGRESS", "COMPLETED"]:
+        print(f"A transcription job with the name {job_name} already exists and is in {job_status} state.")
+        print("Deleting the existing job...")
+        transcribe.delete_transcription_job(TranscriptionJobName=job_name)
+    else:
+        print(f"A transcription job with the name {job_name} already exists and is in {job_status} state.")
+        print("You may want to choose a different job name or handle this case accordingly.")
+except transcribe.exceptions.BadRequestException:
+    # If the job doesn't exist, this exception will be raised, and we can proceed with starting a new job
+    pass
+
+# Start a new transcription job
+transcribe.start_transcription_job(
+    TranscriptionJobName=job_name,
+    LanguageCode="en-US",
+    Media={"MediaFileUri": job_uri},
+    MediaFormat=media_format,
+    Settings={"VocabularyName": vocabulary_name, "ShowSpeakerLabels": True, "MaxSpeakerLabels": 8}
+)
+print(f"Transcription job {job_name} started.")
+
+# Wait for the transcription job to complete
+while True:
+    job = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+    status = job["TranscriptionJob"]["TranscriptionJobStatus"]
+    if status in ["COMPLETED", "FAILED"]:
+        break
+    print(f"Waiting for transcription job {job_name}. Current status: {status}.")
+    time.sleep(10)  # Wait for 10 seconds before checking again
+
+# Check if the job was successful, then convert the transcript to a Word doc.
+if status == "COMPLETED":
+    print(f"Transcription job {job_name} completed successfully.")
+
+    # Get the directory of the current script
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Run the ts-to-word.py script with the job_name as an argument
+    output_file = job_name + ".docx"
+    output_path = os.path.join(source_dir, output_file)
+    try:
+        subprocess.run(["python", "ts-to-word.py", "--inputJob", job_name, "--outputFile", output_path], cwd=current_dir)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running ts-to-word.py: {e}")
+else:
+    print(f"Transcription job {job_name} failed with status: {status}.")
+    if "FailureReason" in job["TranscriptionJob"]:
+        print(f"Failure reason: {job['TranscriptionJob']['FailureReason']}")
+
