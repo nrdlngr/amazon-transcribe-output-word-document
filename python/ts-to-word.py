@@ -97,6 +97,16 @@ class SpeechSegment:
         self.segmentActionItemsDetected = []
         self.segmentOutcomesDetected = []
 
+def get_aws_account_and_region():
+    """
+    Retrieves the current AWS account ID and region.
+    
+    :return: A tuple containing the account ID and region
+    """
+    sts_client = boto3.client('sts')
+    account_id = sts_client.get_caller_identity()["Account"]
+    region = boto3.session.Session().region_name
+    return account_id, region
 
 def convert_timestamp(time_in_seconds):
     """
@@ -1750,6 +1760,11 @@ def generate_document():
     cli_parser.add_argument('--confidence', choices=['on', 'off'], default='off', help='Displays information on word confidence scores throughout the transcript')
     cli_parser.add_argument('--keep', action='store_true', help='Keeps any downloaded job transcript JSON file')
     cli_args = cli_parser.parse_args()
+
+    # Get and print AWS account ID and region
+    account_id, region = get_aws_account_and_region()
+    print(f"Using AWS Account ID: {account_id}")
+    print(f"In AWS Region: {region}")
 
     # If we're downloading a job transcript then validate that we have a job, then download it
     if cli_args.inputJob is not None:

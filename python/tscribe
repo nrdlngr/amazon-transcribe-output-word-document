@@ -17,6 +17,7 @@ For detailed usage instructions, run:
 # Standard library imports
 import argparse
 import os
+import platform
 import re
 import subprocess
 import sys
